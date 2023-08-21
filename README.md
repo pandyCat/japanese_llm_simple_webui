@@ -7,6 +7,7 @@ Rinna-3.6B、OpenCALM等の日本語対応LLM用の簡易Webチャットイン�
 - LoRAの読み込みに対応
 - [Rinna Japanese GPT NeoX 3.6B Instruction PPO](https://huggingface.co/rinna/japanese-gpt-neox-3.6b-instruction-ppo)、[OpenCALM 7B](https://huggingface.co/cyberagent/open-calm-7b)、[Vicuna 7B](https://huggingface.co/lmsys/vicuna-7b-delta-v1.1) で起動できることを確認しています
 - [stablelm-tuned-alpha-chat](https://huggingface.co/spaces/stabilityai/stablelm-tuned-alpha-chat/tree/main) をベースに [Stability AIのチャットスクリプトを利用してRinnaのチャットモデルとお話する](https://nowokay.hatenablog.com/entry/2023/05/22/122040) などを参考に機能を追加しています
+- A100などのML鯖ローカルでLLMを動かし、かつLLMを選択して出力させることができます
 
 # 動作要件
 - NVIDIA GPU、CUDA 環境前提です (GeForce RTX 3060、CUDA 11.7 環境で作成しています)
