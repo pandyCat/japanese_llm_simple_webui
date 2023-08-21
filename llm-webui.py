@@ -9,7 +9,7 @@ from torch.nn import functional as F
 import os
 import re
 from threading import Thread
-from peft import PeftModel
+#from peft import PeftModel
 from transformers import pipeline, StoppingCriteria, StoppingCriteriaList, TextIteratorStreamer
 
 
@@ -21,14 +21,22 @@ from transformers import pipeline, StoppingCriteria, StoppingCriteriaList, TextI
 VERSION = "1.0.0"
 
 # ページの最上部に表示させたいタイトルを設定
-TITLE_STRINGS = "Rinna 3.6B Instruction PPO Chat"
+TITLE_STRINGS = "LLM Cyber Deck"
 
-# モデルタイプ("rinna","rinna4b","opencalm","llama","ja-stablelm","stablelm","bloom","falcon","mpt","line","weblab")
-MODEL_TYPE = "rinna"
+# モデルタイプ("rinna","rinna4b","opencalm","llama","ja-stablelm","stablelm","bloom","falcon","mpt", "stablecode", "line", "weblab10b")
+# ALL_MODEL_TYPE は ',' でsplitしてlistにする
+ALL_MODEL_TYPES = "stablecode,ja-stablelm,rinna"
+
 # ベースモデルを設定
-BASE_MODEL = "rinna/japanese-gpt-neox-3.6b-instruction-ppo"
+ALL_BASE_MODELS = "stabilityai/japanese-stablelm-instruct-alpha-7b,stabilityai/japanese-stablelm-base-alpha-7b,rinna/japanese-gpt-neox-3.6b-instruction-ppo"
+DICT_BASE_MODELS = {}
+DICT_INSTANCE_MODELS = {}
+
 # トークナイザ―の設定
-TOKENIZER_MODEL = "rinna/japanese-gpt-neox-3.6b-instruction-ppo"
+ALL_TOKENIZER_MODELS = ["novelai/nerdstash-tokenizer-v1,novelai/nerdstash-tokenizer-v1,rinna/japanese-gpt-neox-3.6b-instruction-ppo,"]
+DICT_TOKENIZER_MODEL = {}
+DICT_INSTANCE_TOKENIZERS = {}
+
 # モデルを8ビット量子化で実行するか("on","off")
 LOAD_IN_8BIT = "off"
 # モデルを4ビット量子化で実行するか("on","off") bitsandbytes 0.39.0 以降が必要
@@ -37,8 +45,12 @@ LOAD_IN_4BIT = "off"
 # LoRAのディレクトリ(空文字列に設定すると読み込まない)
 LORA_WEIGHTS = ""
 
-# プロンプトタイプ("rinna","vicuna","alpaca","llama2","beluga","ja-stablelm","stablelm","redpajama","falcon","line","weblab","qa","none")
-PROMPT_TYPE = "rinna"
+# プロンプトタイプ("rinna","vicuna","alpaca","llama2","beluga","ja-stablelm","stablelm","redpajama","falcon","qa","none", "stablecode", "line", "weblab10b")
+ALL_PROMPT_TYPES = "stablecode,ja-stablelm,rinna"
+
+# model_type と model_prompt
+DICT_MODEL_TO_PROMPT = {}
+
 # プロンプトが何トークンを超えたら履歴を削除するか
 PROMPT_THRESHOLD = 1024
 # 履歴を削除する場合、何トークン未満まで削除するか
@@ -49,10 +61,10 @@ REPETITION_PENALTY = 1.1
 # 推論時に生成する最大トークン数
 MAX_NEW_TOKENS = 512
 # 推論時の出力の多様さ(大きいほどバリエーションが多様になる)
-TEMPERATURE = 0.7
+TEMPERATURE = 1.0
 
 # WebUIがバインドするIPアドレス
-GRADIO_HOST = '127.0.0.1'
+GRADIO_HOST = "0.0.0.0" #'127.0.0.1'
 # WebUIがバインドするポート番号
 GRADIO_PORT = 7860
 
@@ -62,28 +74,36 @@ SETTING_VISIBLE = "on"
 # デバッグメッセージを標準出力に表示するか("on","off")
 DEBUG_FLAG = "on"
 
+new_line = ""
 
 #------------------
 # クラス、関数定義
 #------------------
 
 class StopOnTokens(StoppingCriteria):
+    def __init__(self, model_name:str) -> None:
+        super().__init__()
+        self.model_name = model_name
+
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         # モデルからこのトークンIDが出力されたら生成をストップする
-        if MODEL_TYPE == "llama":
+        if self.model_name == "llama":
             # 13="\n" (改行が出力されたらストップしたい場合は「13」も追加する)
             stop_ids = [2, 1 ,0]
-        elif MODEL_TYPE == "stablelm":
+        elif self.model_name == "stablelm" or self.model_name == "ja-stablelm" or self.model_name == 'stablecode':
             # 50278="<|USER|>"、50279="<|ASSISTANT|>"、50277="<|SYSTEM|>"、1="<|padding|>"、0="<|endoftext|>"
             stop_ids = [50278, 50279, 50277, 1, 0]
-        elif MODEL_TYPE == "mpt":
+        elif self.model_name == "mpt":
             # 1="<|padding|>"、0="<|endoftext|>" (改行が出力されたらストップしたい場合は「187」も追加する)
             stop_ids = [1, 0]
-        elif MODEL_TYPE == "falcon":
+        elif self.model_name == "falcon":
             # 193="\n"、11="<|endoftext|>" (改行が出力されたらストップしたい場合は「193」も追加する)
             stop_ids = [11]
-        elif MODEL_TYPE == "xgen":
+        elif self.model_name == "xgen":
             stop_ids = [50256]
+        elif self.model_name == "line" or self.model_name == "weblab10b":
+            # ほとんどのトークナイザーは 1="<|padding|>"、0="<|endoftext|>"
+            stop_ids = [1, 0]
         else:
             # ほとんどのトークナイザーは 1="<|padding|>"、0="<|endoftext|>"
             stop_ids = [1, 0]
@@ -92,9 +112,9 @@ class StopOnTokens(StoppingCriteria):
                 return True
         return False
 
-def user(message, history):
+def user(message, history, model_name:str):
     # Rinnaモデルの場合"<NL>"を改行に変換
-    if MODEL_TYPE == "rinna":
+    if model_name == "rinna":
         for item in history:
             item[0] = re.sub("<NL>", "\n", item[0])
             item[1] = re.sub("<NL>", "\n", item[1])
@@ -106,13 +126,13 @@ def user(message, history):
     return "", history + [[message, ""]]
 
 # Regenerateボタンクリック時の動作
-def regen(history):
+def regen(history, model_name:str):
     if len(history) == 0:
         return "", [["", ""]]
     else:
         history[-1][1]=""
         # Rinnaモデルの場合"<NL>"を改行に変換
-        if MODEL_TYPE == "rinna":
+        if model_name == "rinna":
             for item in history:
                 item[0] = re.sub("<NL>", "\n", item[0])
                 item[1] = re.sub("<NL>", "\n", item[1])
@@ -135,101 +155,151 @@ def remove_last(history):
         return history
 
 # プロンプト文字列を生成する関数
-def prompt(curr_system_message, history):
+def prompt(curr_system_message, history, prompt_name:str):
 
     # Rinna-3.6B形式のプロンプト生成
-    if PROMPT_TYPE == "rinna" or PROMPT_TYPE == "line":
+    if prompt_name == "rinna" or prompt_name == "rinna4b":
         messages = curr_system_message + \
             new_line.join([new_line.join(["ユーザー: "+item[0], "システム: "+item[1]])
                     for item in history])
     # Vicuna形式のプロンプト生成
-    elif PROMPT_TYPE == "vicuna":
+    elif prompt_name == "vicuna":
         prefix = f"""A chat between a curious user and an artificial intelligence assistant.{new_line}The assistant gives helpful, detailed, and polite answers to the user's questions.{new_line}{new_line}"""
         messages = curr_system_message + \
             new_line.join([new_line.join(["USER: "+item[0], "ASSISTANT: "+item[1]])
                     for item in history])
         messages = prefix + messages
     # Alpaca形式のプロンプト生成
-    elif PROMPT_TYPE == "alpaca":
+    elif prompt_name == "alpaca":
         prefix = f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.{new_line}{new_line}"""
         messages = curr_system_message + \
             f"{new_line}{new_line}".join([new_line.join([f"### Instruction:{new_line}"+item[0], f"{new_line}### Response:{new_line}"+item[1]])
                     for item in history])
         messages = prefix + messages
     # Llama2 Chat形式のプロンプト生成
-    elif PROMPT_TYPE == "llama2":
+    elif prompt_name == "llama2":
         prefix = f"""System: You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not include any harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure that your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.{new_line}"""
         messages = curr_system_message + \
             new_line.join([new_line.join([f"User: "+item[0], f"Assistant: "+item[1]])
                     for item in history])
         messages = prefix + messages
     # StableBeluga2形式のプロンプト生成
-    elif PROMPT_TYPE == "beluga":
+    elif prompt_name == "beluga":
         prefix = f"""### System:{new_line}You are Stable Beluga, an AI that follows instructions extremely well. Help as much as you can. Remember, be safe, and don't do anything illegal.{new_line}{new_line}"""
         messages = curr_system_message + \
             f"{new_line}{new_line}".join([new_line.join([f"### User:{new_line}"+item[0], f"{new_line}### Assistant:{new_line}"+item[1]])
                     for item in history])
         messages = prefix + messages
-    # Japanese StableLM形式のプロンプト生成
-    elif PROMPT_TYPE == "ja-stablelm":
+
+    # stablecode-instruct形式のプロンプト生成
+    elif prompt_name == "stablecode":
+
+        # pndy
+        # 改行があった場合、最初の行を user_query, 2行目以降を inputsとみなす
+        messages_sub = ""
+        prompts = history[0][0].split(new_line)
+        for item in history:
+            prompts = item[0].split(new_line)
+            if len(prompts) > 1:
+                inputs = f"{new_line}".join(prompts[1:])
+            else:
+                inputs = ""
+            messages_sub += f"{new_line}".join([new_line.join([f"### Instruction\n"+prompts[0], f"### Inputs\n"+inputs, f"### Response: "+item[1]])])
+
+        messages = curr_system_message + messages_sub
+
         prefix = f"""以下は、タスクを説明する指示と、文脈のある入力の組み合わせです。要求を適切に満たす応答を書きなさい。{new_line}{new_line}"""
-        messages = curr_system_message + \
-            f"{new_line}".join([new_line.join([f"### 指示: "+item[0], f"### 応答: "+item[1]])
-                    for item in history])
+#        messages = curr_system_message + \
+#            f"{new_line}".join([new_line.join([f"### 指示: "+item[0], f"### 応答: "+item[1]])
+#                    for item in history])
         messages = prefix + messages
+
+    # Japanese StableLM形式のプロンプト生成
+    elif prompt_name == "ja-stablelm":
+
+        # pndy
+        # 改行があった場合、最初の行を user_query, 2行目以降を inputsとみなす
+        messages_sub = ""
+        prompts = history[0][0].split(new_line)
+        for item in history:
+            prompts = item[0].split(new_line)
+            if len(prompts) > 1:
+                inputs = f"{new_line}".join(prompts[1:])
+            else:
+                inputs = ""
+            messages_sub += f"{new_line}".join([new_line.join([f"### 指示: "+prompts[0], f"### 入力"+inputs, f"### 応答: "+item[1]])])
+
+        messages = curr_system_message + messages_sub
+
+        prefix = f"""以下は、タスクを説明する指示と、文脈のある入力の組み合わせです。要求を適切に満たす応答を書きなさい。{new_line}{new_line}"""
+#        messages = curr_system_message + \
+#            f"{new_line}".join([new_line.join([f"### 指示: "+item[0], f"### 応答: "+item[1]])
+#                    for item in history])
+        messages = prefix + messages
+
     # StableLM形式のプロンプト生成
-    elif PROMPT_TYPE == "stablelm":
+    elif prompt_name == "stablelm":
         prefix = f"""<|SYSTEM|># StableLM Tuned (Alpha version){new_line}- StableLM is a helpful and harmless open-source AI language model developed by StabilityAI.{new_line}- StableLM is excited to be able to help the user, but will refuse to do anything that could be considered harmful to the user.{new_line}- StableLM is more than just an information source, StableLM is also able to write poetry, short stories, and make jokes.{new_line}- StableLM will refuse to participate in anything that could harm a human.{new_line}"""
         messages = curr_system_message + \
             "".join(["".join([f"<|USER|>"+item[0], f"<|ASSISTANT|>"+item[1]])
                     for item in history])
         messages = prefix + messages
     # Radpajama形式のプロンプト生成
-    elif PROMPT_TYPE == "redpajama":
+    elif prompt_name == "redpajama":
         messages = curr_system_message + \
             new_line.join([new_line.join(["<human>: "+item[0], "<bot>: "+item[1]])
                     for item in history])
     # Falcon形式のプロンプト生成
-    elif PROMPT_TYPE == "falcon":
+    elif prompt_name == "falcon":
         messages = curr_system_message + \
             new_line.join([new_line.join(["User: "+item[0], "Asisstant:"+item[1]])
                     for item in history])
     # XGen形式のプロンプト生成
-    elif PROMPT_TYPE == "xgen":
+    elif prompt_name == "xgen":
         prefix = f"""A chat between a curious human and an artificial intelligence assistant.{new_line}The assistant gives helpful, detailed, and polite answers to the human's questions.{new_line}{new_line}"""
         messages = curr_system_message + \
                 new_line.join([new_line.join(["### Human: "+item[0], "### Asisstant: "+item[1]])
                     for item in history])
         messages = prefix + messages
-    # Weblab形式のプロンプト生成
-    elif PROMPT_TYPE == "weblab":
-        prefix = f"""以下は、タスクを説明する指示です。要求を適切に満たす応答を書きなさい。{new_line}{new_line}"""
-        messages = curr_system_message + \
-                f"{new_line}{new_line}".join([f"{new_line}{new_line}".join([f"### 指示:{new_line}"+item[0], f"### 応答:{new_line}"+item[1]])
-                    for item in history])
-        messages = prefix + messages
     # Q&A形式のプロンプト生成
-    elif PROMPT_TYPE == "qa":
+    elif prompt_name == "qa":
         messages = curr_system_message + \
             new_line.join([new_line.join(["Q: "+item[0], "A: "+item[1]])
                     for item in history])
+    # line形式のプロンプト生成
+    elif prompt_name == "line":
+        messages = curr_system_message + \
+            new_line.join([new_line.join(["ユーザー: "+item[0], "システム: "+item[1]])
+                    for item in history])
+    elif prompt_name == "weblab10b":
+        #text = f'以下は、タスクを説明する指示です。要求を適切に満たす応答を書きなさい。\n\n### 指示:\n{text}\n\n### 応答:'
+        prefix = f"""以下は、タスクを説明する指示です。要求を適切に満たす応答を書きなさい。{new_line}{new_line}"""
+        messages = curr_system_message + \
+            f"{new_line}".join([new_line.join([f"### 指示: \n"+item[0], f"\n### 応答: "+item[1]])
+                    for item in history])
+        messages = prefix + messages
+
     # 特定の書式を使用しない(入力した文章の続きを生成する)場合のプロンプト生成
-    elif PROMPT_TYPE == "none":
+    elif prompt_name == "none" or prompt_name=="opencalm":
         messages = curr_system_message + \
             "".join(["".join([item[0], item[1]])
                     for item in history])
-    # PROMPT_TYPE設定が正しくなければ終了する
+    # prompt_name設定が正しくなければ終了する
     else:
-        print(f"Invalid PROMPT_TYPE \"{PROMPT_TYPE}\"")
+        print(f"Invalid prompt_name \"{prompt_name}\"")
         exit()
     # 生成したプロンプト文字列を返す
     return messages
 
 
-def chat(curr_system_message, history, p_do_sample, p_temperature, p_top_k, p_top_p, p_repetition_penalty, p_max_new_tokens):
+def chat(curr_system_message, history, p_do_sample, p_temperature, p_top_k, p_top_p, p_repetition_penalty, p_max_new_tokens, model_name):
+
+    prompt_name = DICT_MODEL_TO_PROMPT[model_name]
+    m = DICT_INSTANCE_MODELS[model_name]
+    tok = DICT_INSTANCE_TOKENIZERS[model_name]
 
     # Initialize a StopOnTokens object
-    stop = StopOnTokens()
+    stop = StopOnTokens(model_name=model_name)
 
     # "<br>"を削除しておく(モデルに付加された<br>タグが渡らないようにする)
     for item in history:
@@ -244,32 +314,36 @@ def chat(curr_system_message, history, p_do_sample, p_temperature, p_top_k, p_to
     del_flag = 0
     while True:
         # プロンプト文字列を生成する
-        messages = prompt(curr_system_message, history)
+        messages = prompt(curr_system_message, history, prompt_name=prompt_name)
         # プロンプトをトークナイザで変換する
-        if MODEL_TYPE == "rinna":
+        if model_name == "rinna":
             messages = re.sub("\n", "<NL>", messages)
             model_inputs = tok([messages], return_tensors="pt", add_special_tokens=False, padding=True)
-        elif MODEL_TYPE == "rinna4b" or MODEL_TYPE == "line":
+        elif model_name == "rinna4b":
             model_inputs = tok([messages], return_tensors="pt", add_special_tokens=False)
-        elif MODEL_TYPE == "opencalm":
+        elif model_name == "opencalm":
             model_inputs = tok([messages], return_tensors="pt")
-        elif MODEL_TYPE == "llama":
+        elif model_name == "llama":
             model_inputs = tok([messages], return_tensors="pt")
-        elif MODEL_TYPE == "ja-stablelm":
+        elif model_name == "stablecode":
+            model_inputs = tok([messages], return_tensors="pt", return_token_type_ids=False) #add_special_tokens=False)
+        elif model_name == "ja-stablelm":
             model_inputs = tok([messages], return_tensors="pt", add_special_tokens=False)
-        elif MODEL_TYPE == "stablelm":
+        elif model_name == "stablelm":
             model_inputs = tok([messages], return_tensors="pt")
-        elif MODEL_TYPE == "bloom":
+        elif model_name == "bloom":
             model_inputs = tok([messages], return_tensors="pt")
-        elif MODEL_TYPE == "falcon":
+        elif model_name == "falcon":
             model_inputs = tok([messages], return_tensors="pt")
             model_inputs.pop('token_type_ids')
-        elif MODEL_TYPE == "mpt":
+        elif model_name == "mpt":
             model_inputs = tok([messages], return_tensors="pt")
-        elif MODEL_TYPE == "xgen":
+        elif model_name == "xgen":
             model_inputs = tok([messages], return_tensors="pt")
-        elif MODEL_TYPE == "weblab":
-            model_inputs = tok([messages], add_special_tokens=False, return_tensors="pt")
+        elif model_name == "line":
+            model_inputs = tok([messages], return_tensors="pt", add_special_tokens=False)
+        elif model_name == "weblab10b":
+            model_inputs = tok([messages], return_tensors="pt", add_special_tokens=False)
             model_inputs.pop('token_type_ids')
         # もしプロンプトのトークン数が多すぎる場合は削除フラグを設定
         if del_flag == 0 and len(model_inputs['input_ids'][0]) > PROMPT_THRESHOLD:
@@ -312,11 +386,21 @@ def chat(curr_system_message, history, p_do_sample, p_temperature, p_top_k, p_to
         temperature=p_temperature,
         num_beams=1,
         repetition_penalty=p_repetition_penalty,
-        pad_token_id=tok.pad_token_id,
-        bos_token_id=tok.bos_token_id,
-        eos_token_id=tok.eos_token_id,
+#        pad_token_id=tok.pad_token_id,
+#        bos_token_id=tok.bos_token_id,
+#        eos_token_id=tok.eos_token_id,
         stopping_criteria=StoppingCriteriaList([stop])
     )
+    if tok.pad_token_id != None:
+        generate_kwargs["pad_token_id"] = tok.pad_token_id
+    if tok.bos_token_id != None:
+        generate_kwargs["bos_token_id"] = tok.bos_token_id
+    if tok.eos_token_id != None:
+        generate_kwargs["eos_token_id"] = tok.eos_token_id
+    
+    if model_name == "line":
+        generate_kwargs['pad_token_id']=tok.pad_token_id
+        
     t = Thread(target=m.generate, kwargs=generate_kwargs)
 
     # スレッドで生成を実行
@@ -327,10 +411,10 @@ def chat(curr_system_message, history, p_do_sample, p_temperature, p_top_k, p_to
     partial_text = ""
     for new_text in streamer:
         # Rinnaモデルの場合"<NL>"を改行に変換
-        if MODEL_TYPE == "rinna":
+        if model_name == "rinna":
             new_text = re.sub("<NL>", "\n", new_text)
         # XGenモデルの場合<|endoftext|>は表示させない
-        if MODEL_TYPE == "xgen":
+        if model_name == "xgen":
             new_text = re.sub("^<\|endoftext\|>$", "", new_text)
         #print(new_text)
         partial_text += new_text
@@ -341,6 +425,281 @@ def chat(curr_system_message, history, p_do_sample, p_temperature, p_top_k, p_to
         print(f"--generated strings--\n{partial_text}\n----\n")
     return partial_text
 
+def loadModelAndPromp(model_name: str, tokenizer_name: str):
+
+    global new_line
+
+    model_data_name     = DICT_BASE_MODELS[model_name]
+    tokenizer_data_name = DICT_TOKENIZER_MODEL[model_name]
+    
+    # Rinna-3.6Bモデルの場合
+    if model_name == "rinna":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        # 改行を示す文字の設定
+        new_line = "<NL>"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name, 
+            torch_dtype=torch.float16, 
+            load_in_8bit=LOAD_IN_8BIT, 
+            load_in_4bit=LOAD_IN_4BIT, 
+            device_map='auto'
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = AutoTokenizer.from_pretrained(tokenizer_data_name, use_fast=False)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+        # padding設定
+        m.config.pad_token_id = tok.eos_token_id
+    # Rinna-4Bモデルの場合
+    elif model_name == "rinna4b":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name, 
+            torch_dtype=torch.float16, 
+            load_in_8bit=LOAD_IN_8BIT, 
+            load_in_4bit=LOAD_IN_4BIT, 
+            device_map='auto'
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = AutoTokenizer.from_pretrained(tokenizer_data_name, use_fast=False)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+        # padding設定
+        m.config.pad_token_id = tok.eos_token_id
+    # Open CALMモデルの場合
+    elif model_name == "opencalm":
+        from transformers import AutoModelForCausalLM, GPTNeoXTokenizerFast
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name, 
+            torch_dtype=torch.float16, 
+            load_in_8bit=LOAD_IN_8BIT, 
+            load_in_4bit=LOAD_IN_4BIT, 
+            device_map='auto'
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = GPTNeoXTokenizerFast.from_pretrained(tokenizer_data_name)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+    # Llama系モデルの場合
+    elif model_name == "llama":
+        from transformers import LlamaForCausalLM, LlamaTokenizer
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = LlamaForCausalLM.from_pretrained(
+            model_data_name, 
+            torch_dtype=torch.float16, 
+            load_in_8bit=LOAD_IN_8BIT, 
+            load_in_4bit=LOAD_IN_4BIT, 
+            device_map='auto',
+            rope_scaling={"type": "dynamic", "factor": 2.0}
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = LlamaTokenizer.from_pretrained(tokenizer_data_name)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+
+    # stablecode の場合
+    elif  model_name == "stablecode":
+        # 改行を示す文字の設定
+        new_line = "\n"
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = AutoTokenizer.from_pretrained(tokenizer_data_name)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(model_data_name,
+        trust_remote_code=True,
+        torch_dtype="auto",
+        )
+        m.eval()
+        assert torch.cuda.is_available()
+        m = m.cuda()
+        print(f"Sucessfully loaded the model to the memory")
+
+    # Japanese StableLMモデルの場合
+    elif model_name == "ja-stablelm":
+
+        # 改行を示す文字の設定
+        new_line = "\n"
+
+        from transformers import LlamaTokenizer, AutoModelForCausalLM
+
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = LlamaTokenizer.from_pretrained("novelai/nerdstash-tokenizer-v1", additional_special_tokens=['▁▁'])
+        print(f"Sucessfully loaded the tokenizer to the memory")
+
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            "stabilityai/japanese-stablelm-instruct-alpha-7b",    
+            trust_remote_code=True,
+        )
+        m.half()
+        m.eval()
+        assert torch.cuda.is_available()
+        m = m.to("cuda")
+        print(f"Sucessfully loaded the model to the memory")
+
+    # StableLMモデルの場合
+    elif model_name == "stablelm":
+        from transformers import AutoModelForCausalLM, GPTNeoXTokenizerFast
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name,
+            torch_dtype=torch.float16,
+            load_in_8bit=LOAD_IN_8BIT,
+            load_in_4bit=LOAD_IN_4BIT, 
+            device_map='auto'
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = GPTNeoXTokenizerFast.from_pretrained(tokenizer_data_name)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+    # Bloomモデルの場合
+    elif model_name == "bloom":
+        from transformers import AutoModelForCausalLM, BloomTokenizerFast
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name,
+            torch_dtype=torch.float16,
+            load_in_8bit=LOAD_IN_8BIT,
+            load_in_4bit=LOAD_IN_4BIT, 
+            device_map='auto'
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = BloomTokenizerFast.from_pretrained(tokenizer_data_name)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+    # Falconモデルの場合
+    elif model_name == "falcon":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name,
+            torch_dtype=torch.float16,
+            load_in_8bit=LOAD_IN_8BIT,
+            load_in_4bit=LOAD_IN_4BIT, 
+            trust_remote_code=True,
+            device_map='auto'
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = AutoTokenizer.from_pretrained(tokenizer_data_name)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+    # MPTモデルの場合
+    elif model_name == "mpt":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name,
+            torch_dtype=torch.float16,
+            load_in_8bit=LOAD_IN_8BIT,
+            load_in_4bit=LOAD_IN_4BIT, 
+            trust_remote_code=True,
+            device_map='auto'
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = AutoTokenizer.from_pretrained(tokenizer_data_name)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+    # Xgenモデルの場合
+    elif model_name == "xgen":
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name,
+            torch_dtype=torch.float16,
+            load_in_8bit=LOAD_IN_8BIT,
+            device_map='auto'
+            )
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = AutoTokenizer.from_pretrained(tokenizer_data_name, trust_remote_code=True)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+    elif model_name == "line":
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name,
+            torch_dtype=torch.float16,
+            device_map="auto")
+
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = AutoTokenizer.from_pretrained(tokenizer_data_name, use_fast=False)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+    elif model_name == "weblab10b":
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        # 改行を示す文字の設定
+        new_line = "\n"
+        # モデルのロード
+        print(f"Starting to load the model \"{model_data_name}\" to memory")
+        m = AutoModelForCausalLM.from_pretrained(
+            model_data_name,
+            torch_dtype=torch.float16,
+            device_map="auto")
+
+        print(f"Sucessfully loaded the model to the memory")
+        # トークナイザ―のロード
+        print(f"Starting to load the tokenizer \"{tokenizer_data_name}\" to memory")
+        tok = AutoTokenizer.from_pretrained(tokenizer_data_name, use_fast=False)
+        print(f"Sucessfully loaded the tokenizer to the memory")
+
+
+    # name設定が正しくなければ終了する
+    else:
+        print(f"Invalid model_name \"{model_name}\"")
+        exit()
+
+    DICT_INSTANCE_MODELS[model_name] = m
+    DICT_INSTANCE_TOKENIZERS[model_name] = tok  # モデルネームで引けるようにしよう
+
+    return
+
+
+
 
 #------
 # 実行
@@ -348,13 +707,15 @@ def chat(curr_system_message, history, p_do_sample, p_temperature, p_top_k, p_to
 
 # 引数を取得
 parser = argparse.ArgumentParser()
-parser.add_argument("--model", type=str, default=BASE_MODEL, help="モデル名またはディレクトリのパス")
-parser.add_argument("--model-type", type=str, choices=["rinna", "rinna4b", "opencalm", "llama", "ja-stablelm", "stablelm", "bloom", "falcon", "mpt", "xgen", "line", "weblab"],  default=MODEL_TYPE, help="モデルタイプ名")
-parser.add_argument("--tokenizer", type=str, default=TOKENIZER_MODEL, help="トークナイザー名またはディレクトリのパス")
+parser.add_argument("--all-base-models", type=str, default=ALL_BASE_MODELS, help="モデル名またはディレクトリのパス")
+parser.add_argument("--all-model-types", type=str, default="ja-stablelm", help="モデルタイプ名")
+#parser.add_argument("--all-model-types", type=str, choices=["rinna", "rinna4b", "opencalm", "llama", "ja-stablelm", "stablelm", "bloom", "falcon", "mpt", "xgen", "stablecode","line", "weblab10b"], default="ja-stablelm", help="モデルタイプ名")
+parser.add_argument("--all-tokenizer-models", type=str, default=ALL_TOKENIZER_MODELS, help="トークナイザー名またはディレクトリのパス")
 parser.add_argument("--load-in-8bit", type=str, choices=["on", "off"], default=LOAD_IN_8BIT, help="8bit量子化するかどうか")
 parser.add_argument("--load-in-4bit", type=str, choices=["on", "off"], default=LOAD_IN_4BIT, help="4bit量子化するかどうか")
 parser.add_argument("--lora", type=str, default=LORA_WEIGHTS, help="LoRAディレクトリのパス")
-parser.add_argument("--prompt-type", type=str, choices=["rinna", "vicuna", "alpaca", "llama2", "beluga", "ja-stablelm", "stablelm", "redpajama", "falcon", "xgen", "weblab", "line", "qa", "none"], default=PROMPT_TYPE, help="プロンプトタイプ名")
+parser.add_argument("--all-prompt-types", type=str, default="ja-stablelm", help="プロンプトタイプ名")
+#parser.add_argument("--all-prompt-types", type=str, choices=["rinna", "vicuna", "alpaca", "llama2", "beluga", "ja-stablelm", "stablelm", "redpajama", "falcon", "xgen", "qa", "none", "stablecode", "line", "weblab10b"], default="ja-stablelm", help="プロンプトタイプ名")
 parser.add_argument("--prompt-threshold", type=int, default=PROMPT_THRESHOLD, help="このトークン数を超えたら古い履歴を削除")
 parser.add_argument("--prompt-deleted", type=int, default=PROMPT_DELETED, help="古い履歴削除時にこのトークン以下にする")
 parser.add_argument("--repetition-penalty", type=float, default=REPETITION_PENALTY, help="繰り返しに対するペナルティ")
@@ -368,13 +729,13 @@ parser.add_argument("--debug", type=str, choices=["on", "off"], default=DEBUG_FL
 args = parser.parse_args()
 
 # 引数でセットされた値で上書きする
-BASE_MODEL = args.model
-MODEL_TYPE = args.model_type
-TOKENIZER_MODEL = args.tokenizer
+ALL_BASE_MODELS = args.all_base_models.split(',')
+ALL_MODEL_TYPES = args.all_model_types.split(',')
+ALL_TOKENIZER_MODELS = args.all_tokenizer_models.split(',')
 LOAD_IN_8BIT = args.load_in_8bit
 LOAD_IN_4BIT = args.load_in_4bit
 LORA_WEIGHTS = args.lora
-PROMPT_TYPE = args.prompt_type
+ALL_PROMPT_TYPES = args.all_prompt_types.split(',')
 PROMPT_THRESHOLD = args.prompt_threshold
 PROMPT_DELETED = args.prompt_deleted
 REPETITION_PENALTY=args.repetition_penalty
@@ -386,18 +747,31 @@ GRADIO_PORT = args.port
 TITLE_STRINGS = args.title
 DEBUG_FLAG = args.debug
 
+# modelの名前とtokenizerの名前の辞書
+assert len(ALL_MODEL_TYPES) == len(ALL_PROMPT_TYPES)
+for cc in range(len(ALL_MODEL_TYPES)):
+    DICT_MODEL_TO_PROMPT[ALL_MODEL_TYPES[cc]] = ALL_PROMPT_TYPES[cc]
+
+assert len(ALL_MODEL_TYPES) == len(ALL_BASE_MODELS)
+for cc in range(len(ALL_MODEL_TYPES)):
+    DICT_BASE_MODELS[ALL_MODEL_TYPES[cc]] = ALL_BASE_MODELS[cc]
+
+assert len(ALL_MODEL_TYPES) == len(ALL_TOKENIZER_MODELS)
+for cc in range(len(ALL_MODEL_TYPES)):
+    DICT_TOKENIZER_MODEL[ALL_MODEL_TYPES[cc]] = ALL_TOKENIZER_MODELS[cc]
+
 # パラメータ表示
 print("---- パラメータ ----")
-print(f"モデル名orパス: {BASE_MODEL}")
-print(f"モデルタイプ名: {MODEL_TYPE}")
-print(f"トークナイザー: {TOKENIZER_MODEL}")
+print(f"モデル名orパス: {ALL_BASE_MODELS}")
+print(f"モデルタイプ名: {ALL_MODEL_TYPES}")
+print(f"トークナイザー: {ALL_TOKENIZER_MODELS}")
 print(f"8bit量子化: {LOAD_IN_8BIT}")
 print(f"4bit量子化: {LOAD_IN_4BIT}")
 if LORA_WEIGHTS == "":
     print(f"LoRAモデルパス: (LoRAなし)")
 else:
     print(f"LoRAモデルパス: {LORA_WEIGHTS}")
-print(f"プロンプトタイプ: {PROMPT_TYPE}")
+print(f"プロンプトタイプ: {ALL_PROMPT_TYPES}")
 print(f"プロンプトトークン数しきい値: {PROMPT_THRESHOLD}")
 print(f"プロンプトトークン数削除値: {PROMPT_DELETED}")
 print(f"繰り返しペナルティ: {REPETITION_PENALTY}")
@@ -431,234 +805,18 @@ else:
     DEBUG_FLAG = False
 
 ## モデルタイプによる設定とモデルのロード
+for model_name in ALL_MODEL_TYPES:
+    tokenizer_name = DICT_MODEL_TO_PROMPT[model_name]
+    loadModelAndPromp(model_name=model_name, tokenizer_name=tokenizer_name)
 
-# Rinna-3.6Bモデルの場合
-if MODEL_TYPE == "rinna":
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    # 改行を示す文字の設定
-    new_line = "<NL>"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL, 
-        torch_dtype=torch.float16, 
-        load_in_8bit=LOAD_IN_8BIT, 
-        load_in_4bit=LOAD_IN_4BIT, 
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, use_fast=False)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-    # padding設定
-    m.config.pad_token_id = tok.eos_token_id
-# Rinna-4B、LINE-Japanese-Large-LMモデルの場合
-elif MODEL_TYPE == "rinna4b" or MODEL_TYPE == "line":
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL, 
-        torch_dtype=torch.float16, 
-        load_in_8bit=LOAD_IN_8BIT, 
-        load_in_4bit=LOAD_IN_4BIT, 
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, use_fast=False)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-    # padding設定
-    m.config.pad_token_id = tok.eos_token_id
-# Open CALMモデルの場合
-elif MODEL_TYPE == "opencalm":
-    from transformers import AutoModelForCausalLM, GPTNeoXTokenizerFast
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL, 
-        torch_dtype=torch.float16, 
-        load_in_8bit=LOAD_IN_8BIT, 
-        load_in_4bit=LOAD_IN_4BIT, 
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = GPTNeoXTokenizerFast.from_pretrained(TOKENIZER_MODEL)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# Llama系モデルの場合
-elif MODEL_TYPE == "llama":
-    from transformers import LlamaForCausalLM, LlamaTokenizer
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = LlamaForCausalLM.from_pretrained(
-        BASE_MODEL, 
-        torch_dtype=torch.float16, 
-        load_in_8bit=LOAD_IN_8BIT, 
-        load_in_4bit=LOAD_IN_4BIT, 
-        device_map='auto',
-        rope_scaling={"type": "dynamic", "factor": 2.0}
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = LlamaTokenizer.from_pretrained(TOKENIZER_MODEL)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# Japanese StableLMモデルの場合
-elif MODEL_TYPE == "ja-stablelm":
-    from transformers import AutoModelForCausalLM, LlamaTokenizer
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT, 
-        trust_remote_code=True,
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = LlamaTokenizer.from_pretrained(TOKENIZER_MODEL, additional_special_tokens=['▁▁'])
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# StableLMモデルの場合
-elif MODEL_TYPE == "stablelm":
-    from transformers import AutoModelForCausalLM, GPTNeoXTokenizerFast
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT, 
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = GPTNeoXTokenizerFast.from_pretrained(TOKENIZER_MODEL)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# Bloomモデルの場合
-elif MODEL_TYPE == "bloom":
-    from transformers import AutoModelForCausalLM, BloomTokenizerFast
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT, 
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = BloomTokenizerFast.from_pretrained(TOKENIZER_MODEL)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# Falconモデルの場合
-elif MODEL_TYPE == "falcon":
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT, 
-        trust_remote_code=True,
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_MODEL)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# MPTモデルの場合
-elif MODEL_TYPE == "mpt":
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT, 
-        trust_remote_code=True,
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_MODEL)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# Xgenモデルの場合
-elif MODEL_TYPE == "xgen":
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        load_in_8bit=LOAD_IN_8BIT,
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, trust_remote_code=True)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# Weblabモデルの場合
-elif MODEL_TYPE == "weblab":
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    # 改行を示す文字の設定
-    new_line = "\n"
-    # モデルのロード
-    print(f"Starting to load the model \"{BASE_MODEL}\" to memory")
-    m = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        torch_dtype=torch.float16,
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT, 
-        device_map='auto'
-        )
-    print(f"Sucessfully loaded the model to the memory")
-    # トークナイザ―のロード
-    print(f"Starting to load the tokenizer \"{TOKENIZER_MODEL}\" to memory")
-    tok = AutoTokenizer.from_pretrained(TOKENIZER_MODEL)
-    print(f"Sucessfully loaded the tokenizer to the memory")
-# MODEL_TYPE設定が正しくなければ終了する
-else:
-    print(f"Invalid MODEL_TYPE \"{MODEL_TYPE}\"")
-    exit()
+# ジェネレータの作成 (不要だと思われるためコメントアウト)
+#generator = pipeline('text-generation', model=m, tokenizer=tok)
 
-
-# LoRAのロード
-if LORA_WEIGHTS != "":
-    print(f"Starting to load the LoRA weights \"{LORA_WEIGHTS}\" to memory")
-    m = PeftModel.from_pretrained(m, LORA_WEIGHTS, torch_dtype=torch.float16)
-    print(f"Sucessfully loaded the LoRA weights to the memory")
+## LoRAのロード
+#if LORA_WEIGHTS != "":
+#    print(f"Starting to load the LoRA weights \"{LORA_WEIGHTS}\" to memory")
+#    m = PeftModel.from_pretrained(m, LORA_WEIGHTS, torch_dtype=torch.float16)
+#    print(f"Sucessfully loaded the LoRA weights to the memory")
 
 # プロンプトの先頭に付加する文字列
 start_message = ""
@@ -670,8 +828,10 @@ with gr.Blocks(title="LLM Simple WebUI", theme=gr.themes.Base()) as demo:
     gr.Markdown(f"## {TITLE_STRINGS}")
     chatbot = gr.Chatbot().style(height=500)
     with gr.Row():
+        p_model_list = gr.Dropdown(ALL_MODEL_TYPES, label="どのLLMかえらんでね！",value=ALL_MODEL_TYPES[0])
+    with gr.Row():
         with gr.Column(scale=20):
-            msg = gr.Textbox(label="Chat Message Box", placeholder="Chat Message Box",
+            msg = gr.Textbox(label="Chat Message Box", placeholder="ここに入力",
                              show_label=False).style(container=False)
         with gr.Column(scale=1, min_width=100):
             submit = gr.Button("Submit")
@@ -689,19 +849,23 @@ with gr.Blocks(title="LLM Simple WebUI", theme=gr.themes.Base()) as demo:
         with gr.Blocks():
             p_max_new_tokens = gr.Slider(minimum=1, maximum=2048, value=MAX_NEW_TOKENS, step=1, label="Max New Tokens", interactive=True)
             p_repetition_penalty = gr.Slider(minimum=1.00, maximum=5.00, value=REPETITION_PENALTY, step=0.01, label="Repetition Penalty (1.00=ペナルティなし)", interactive=True)
+    with gr.Row():
+        str_llm_enum = "\n".join(str(kk) + "\t\t: " + str(vv)
+            for kk, vv in DICT_BASE_MODELS.items())
+        gr.Text(str_llm_enum, label="ローカルで動作中のLLMインスタンスは以下の通りです")
 
     system_msg = gr.Textbox(
         start_message, label="System Message", interactive=False, visible=False)
 
-    submit_event = msg.submit(fn=user, inputs=[msg, chatbot], outputs=[msg, chatbot], queue=False).then(
-        fn=chat, inputs=[system_msg, chatbot, p_do_sample, p_temperature, p_top_k, p_top_p, p_repetition_penalty, p_max_new_tokens], outputs=[chatbot], queue=True)
+    submit_event = msg.submit(fn=user, inputs=[msg, chatbot, p_model_list], outputs=[msg, chatbot], queue=False).then(
+        fn=chat, inputs=[system_msg, chatbot, p_do_sample, p_temperature, p_top_k, p_top_p, p_repetition_penalty, p_max_new_tokens, p_model_list], outputs=[chatbot], queue=True)
 
-    submit_click_event = submit.click(fn=user, inputs=[msg, chatbot], outputs=[msg, chatbot], queue=False).then(
-        fn=chat, inputs=[system_msg, chatbot, p_do_sample, p_temperature, p_top_k, p_top_p, p_repetition_penalty, p_max_new_tokens], outputs=[chatbot], queue=True)
+    submit_click_event = submit.click(fn=user, inputs=[msg, chatbot, p_model_list], outputs=[msg, chatbot], queue=False).then(
+        fn=chat, inputs=[system_msg, chatbot, p_do_sample, p_temperature, p_top_k, p_top_p, p_repetition_penalty, p_max_new_tokens, p_model_list], outputs=[chatbot], queue=True)
 
-    regenerate_click_event = regenerate.click(fn=regen, inputs=[chatbot], outputs=[msg, chatbot], queue=False).then(
+    regenerate_click_event = regenerate.click(fn=regen, inputs=[chatbot, p_model_list], outputs=[msg, chatbot], queue=False).then(
                lambda: None, None, [msg], queue=False).then(
-                   fn=chat, inputs=[system_msg, chatbot, p_do_sample, p_temperature, p_top_k, p_top_p, p_repetition_penalty, p_max_new_tokens], outputs=[chatbot], queue=True)
+                   fn=chat, inputs=[system_msg, chatbot, p_do_sample, p_temperature, p_top_k, p_top_p, p_repetition_penalty, p_max_new_tokens, p_model_list], outputs=[chatbot], queue=True)
 
     stop.click(fn=None, inputs=None, outputs=None, cancels=[submit_event, submit_click_event, regenerate_click_event], queue=False)
 
